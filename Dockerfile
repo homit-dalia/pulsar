@@ -28,6 +28,7 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash agent
 COPY bridge.py /app/bridge.py
 COPY agent/ /app/agent/
 COPY worker/ /app/worker/
+COPY supabase/tables.sql /app/supabase/tables.sql
 COPY --chmod=755 notify delegate /usr/local/bin/
 
 CMD ["/opt/bridge/bin/python", "/app/bridge.py"]

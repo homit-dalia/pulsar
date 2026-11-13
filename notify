@@ -1,9 +1,8 @@
 #!/bin/sh
-# Queue a WhatsApp message to the owner; the bridge sends it within a second.
+# Queue a WhatsApp message to the owner: a row in agent.messages, which the bridge sends within a second.
 #   notify "text"
 #   notify --file /path/to/file ["caption"]
 set -eu
-outbox="${DATA_DIR:-/data}/outbox"
 file=""
 if [ "${1:-}" = "--file" ]; then
   [ -r "${2:-}" ] || { echo "notify: cannot read file '${2:-}'" >&2; exit 1; }
@@ -12,6 +11,7 @@ if [ "${1:-}" = "--file" ]; then
 fi
 text="$*"
 [ -n "$text$file" ] || { echo 'usage: notify "text" | notify --file PATH ["caption"]' >&2; exit 2; }
-tmp=$(mktemp "$outbox/.notify.XXXXXX")
-jq -n --arg text "$text" --arg file "$file" '{text: $text, file: $file}' > "$tmp"
-mv "$tmp" "$outbox/$(date +%s%N)-${tmp##*.}.json"
+psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -v body="$text" -v file="$file" -v run="${RUN_ID:-}" <<'SQL'
+insert into agent.messages (direction, body, file_path, run_id)
+values ('out', :'body', nullif(:'file', ''), nullif(:'run', '')::bigint);
+SQL

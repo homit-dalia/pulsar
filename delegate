@@ -1,12 +1,15 @@
 #!/bin/sh
 # Hand a job to the worker (a Fly Sprite with its own Claude and a stealth browser).
-#   delegate "brief"          queue a job; its report arrives later as a [Worker report] run
-#   delegate --file PATH      same, with the brief read from a file
-#   delegate --status         what the worker is doing, and how many jobs are queued
-#   delegate --cancel         stop the current job and drop queued ones
+#   delegate "brief"                queue a job; its report arrives later as a [Worker report] run
+#   delegate --file PATH            same, with the brief read from a file
+#   delegate --residential ...      also give this one job the owner's paid residential-IP keys
+#   delegate --status               what the worker is doing, and how many jobs are queued
+#   delegate --cancel               stop the current job and drop queued ones
 set -eu
 data="${DATA_DIR:-/data}"
 dir="$data/delegate"
+residential=false
+if [ "${1:-}" = "--residential" ]; then residential=true; shift; fi
 case "${1:-}" in
   --status)
     if [ -f "$data/state/worker.json" ]; then cat "$data/state/worker.json"; echo; else echo "The worker is idle."; fi
@@ -17,12 +20,13 @@ case "${1:-}" in
     echo "Cancelling the worker's job and any queued ones."
     exit 0 ;;
   --file) brief=$(cat "$2") ;;
-  "") echo 'usage: delegate "brief" | delegate --file PATH | delegate --status | delegate --cancel' >&2; exit 2 ;;
+  "") echo 'usage: delegate [--residential] "brief" | delegate [--residential] --file PATH | delegate --status | delegate --cancel' >&2; exit 2 ;;
   *) brief="$*" ;;
 esac
 [ -n "$brief" ] || { echo "delegate: the brief is empty" >&2; exit 2; }
 id="$(date +%Y%m%d-%H%M%S)-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 tmp=$(mktemp "$dir/.request.XXXXXX")
-jq -n --arg id "$id" --arg brief "$brief" '{id: $id, brief: $brief}' > "$tmp"
+jq -n --arg id "$id" --arg brief "$brief" --argjson residential "$residential" \
+  '{id: $id, brief: $brief, residential: $residential}' > "$tmp"
 mv "$tmp" "$dir/$id.json"
-echo "Queued worker job $id. Its report will arrive as a [Worker report] run; nothing more to do now."
+echo "Queued worker job $id$([ "$residential" = true ] && echo ' (residential IP)'). Its report will arrive as a [Worker report] run; nothing more to do now."

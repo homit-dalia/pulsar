@@ -7,6 +7,8 @@ A single process on one small, always-on Fly Machine:
   * runs the orchestrator (`claude -p`), one job at a time
   * runs what the orchestrator `delegate`s on one Fly Sprite, which has its own Claude and a
     browser and sleeps when idle; each job's report comes back to the orchestrator as a new job
+  * records every run in agent.runs and every message in agent.messages. Outbound messages are
+    only ever queued there, and one sender delivers them in order
 
 No agent logic lives here: the agents' instructions are agent/CLAUDE.md and worker/CLAUDE.md.
 
@@ -50,6 +52,7 @@ CHAT_IDLE_SECONDS = float(os.environ.get("CHAT_SESSION_IDLE_HOURS", "6")) * 3600
 MAX_TURNS = os.environ.get("MAX_TURNS", "100")
 
 STOP = threading.Event()
+TABLES_READY = threading.Event()
 RUN = {"proc": None, "stopped": False}
 SESSION_FILE = DATA / "state" / "chat_session.json"
 USER_FILE = DATA / "state" / "wa_user"
@@ -82,6 +85,66 @@ def owner():
     return USER_FILE.read_text().strip() if USER_FILE.exists() else ""
 
 
+# ---------------------------------------------------------------- Postgres
+
+_db = None
+DB_LOCK = threading.Lock()
+
+
+def sql(query, *args):
+    """Runs one query (or, without args, a whole script) on a shared autocommit connection."""
+    global _db
+    import psycopg
+
+    with DB_LOCK:
+        for attempt in range(2):
+            try:
+                if _db is None or _db.closed:
+                    _db = psycopg.connect(
+                        os.environ["DATABASE_URL"], autocommit=True, prepare_threshold=None, connect_timeout=15
+                    )
+                cursor = _db.execute(query, args) if args else _db.execute(query)
+                return cursor.fetchall() if cursor.description else []
+            except psycopg.OperationalError:
+                _db = None
+                if attempt:
+                    raise
+                time.sleep(2)
+
+
+def get_state(key):
+    rows = sql("select value from agent.bridge_state where key = %s", key)
+    return rows[0][0] if rows else None
+
+
+def set_state(key, value):
+    sql(
+        "insert into agent.bridge_state (key, value) values (%s, %s) "
+        "on conflict (key) do update set value = excluded.value, updated_at = now()",
+        key, str(value),
+    )
+
+
+def start_run(kind, label, text):
+    """Records the start of an orchestrator turn or worker job; returns its id (None if Postgres is down)."""
+    try:
+        return sql("insert into agent.runs (kind, label, input) values (%s, %s, %s) returning id",
+                   kind, label, text[:50000])[0][0]
+    except Exception as e:  # noqa: BLE001 - telemetry must never block the work
+        log("run not recorded:", repr(e))
+        return None
+
+
+def finish_run(run_id, status, output="", session=None):
+    if run_id is None:
+        return
+    try:
+        sql("update agent.runs set status = %s, output = %s, session_id = coalesce(%s, session_id), "
+            "finished_at = now() where id = %s", status, (output or "")[:50000], session, run_id)
+    except Exception as e:  # noqa: BLE001
+        log("run not updated:", repr(e))
+
+
 # ---------------------------------------------------------------- WhatsApp
 
 SEND_LOCK = threading.Lock()  # the API asks for no concurrent sends to one recipient
@@ -93,39 +156,32 @@ def wa(method, path, body=None, headers=None, timeout=60):
 
 
 def _send(payload):
-    """POST /messages with the manual's retry rules. Returns the message id, or None."""
+    """POST /messages with the manual's retry rules. Returns (message id, error)."""
+    error = None
     for attempt in range(4):
         try:
             status, response = wa("POST", "/messages", payload, timeout=120)
         except OSError as e:  # outcome unknown; retrying could send it twice
-            log("send error:", e)
-            return None
+            return None, f"network error: {e}"
         if status == 200:
-            return json.loads(response)["messages"][0]["id"]
-        if status in (429, 503):
-            time.sleep(5 * 2**attempt)
-            continue
-        log("send failed:", status, response[:300])
-        return None
-    return None
-
-
-def record_outbound(wamid, text):
-    """Log what the owner was sent, so the orchestrator can resolve quoted replies later."""
-    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    with (DATA / "state" / "outbox.log").open("a") as f:
-        f.write(f"{stamp}\t{wamid or 'NOT-SENT'}\t{text[:2000]!r}\n")
+            return json.loads(response)["messages"][0]["id"], None
+        error = f"HTTP {status}: {response[:300]!r}"
+        if status not in (429, 503):
+            break
+        time.sleep(5 * 2**attempt)
+    log("send failed:", error)
+    return None, error
 
 
 def send_text(user, text):
-    text = (text or "").strip()
-    if not user or not text:
-        return
+    wamid, error = None, "empty message"
     with SEND_LOCK:
         for i in range(0, len(text), 4000):
-            chunk = text[i : i + 4000]
-            payload = {"messaging_product": "whatsapp", "to": user, "type": "text", "text": {"body": chunk}}
-            record_outbound(_send(payload), chunk)
+            payload = {"messaging_product": "whatsapp", "to": user, "type": "text", "text": {"body": text[i : i + 4000]}}
+            wamid, error = _send(payload)
+            if not wamid:
+                break
+    return wamid, error
 
 
 def send_file(user, path, caption=""):
@@ -143,17 +199,75 @@ def send_file(user, path, caption=""):
     content_type = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
     status, response = wa("POST", "/media", body, content_type, timeout=300)
     if status != 200:
-        log("upload failed:", status, response[:300])
-        send_text(user, f"(Couldn't send {name}: upload failed with HTTP {status}.)")
-        return
+        return None, f"upload failed with HTTP {status}: {response[:300]!r}"
     media = {"id": json.loads(response)["id"]}
     if caption and kind != "audio":
         media["caption"] = caption[:1024]
     if kind == "document":
         media["filename"] = name
     with SEND_LOCK:
-        wamid = _send({"messaging_product": "whatsapp", "to": user, "type": kind, kind: media})
-        record_outbound(wamid, f"[file {name}] {caption}")
+        return _send({"messaging_product": "whatsapp", "to": user, "type": kind, kind: media})
+
+
+def deliver_now(user, body, file_path=None):
+    """Sends one message to the owner; returns (message id, error)."""
+    if not user:
+        return None, "the owner hasn't messaged yet"
+    if not file_path:
+        return send_text(user, body)
+    try:
+        st = os.stat(file_path)
+    except OSError as e:
+        return None, str(e)
+    agent_uid = agent_ids()[0] if os.geteuid() == 0 else os.geteuid()
+    if st.st_uid != agent_uid and not st.st_mode & 0o004:  # only files the agent could read itself
+        return None, f"{file_path} isn't readable by the agent"
+    return send_file(user, file_path, body)
+
+
+def queue_message(text="", file_path=None, run_id=None):
+    """Everything the owner is sent goes through agent.messages; sender_loop delivers it."""
+    text = (text or "").strip()
+    if not text and not file_path:
+        return
+    try:
+        sql("insert into agent.messages (direction, body, file_path, run_id) values ('out', %s, %s, %s)",
+            text, file_path, run_id)
+    except Exception as e:  # noqa: BLE001 - Postgres is down: send it directly rather than lose it
+        log("couldn't queue a message, sending directly:", repr(e))
+        deliver_now(owner(), text, file_path)
+
+
+def sender_loop():
+    """Delivers queued outbound messages one at a time, in order, about once a second."""
+    TABLES_READY.wait()
+    while not STOP.is_set():
+        try:
+            user = owner()
+            rows = sql("select id, body, file_path from agent.messages where direction = 'out' "
+                       "and status = 'pending' order by id limit 20") if user else []
+            for mid, body, file_path in rows:
+                wamid, error = deliver_now(user, body, file_path)
+                sql("update agent.messages set status = %s, wa_message_id = %s, error = %s, sent_at = now() "
+                    "where id = %s", "sent" if wamid else "failed", wamid, error, mid)
+            time.sleep(1)
+        except Exception as e:  # noqa: BLE001
+            log("sender:", repr(e))
+            time.sleep(5)
+
+
+def record_inbound(messages):
+    for msg in messages:
+        kind = msg.get("type")
+        if kind == "text":
+            body = msg["text"]["body"]
+        elif kind == "reaction":
+            body = f"[reaction {msg['reaction'].get('emoji') or '(removed)'}]"
+        else:
+            media = msg.get(kind) or {}
+            body = " ".join(filter(None, [f"[{kind}]", media.get("filename"), media.get("caption")]))
+        sql("insert into agent.messages (direction, body, status, wa_message_id) values ('in', %s, 'received', %s) "
+            "on conflict (wa_message_id) do nothing", body, msg["id"])
 
 
 def download(media):
@@ -210,7 +324,7 @@ def give_to_agent(path):
         os.chown(path, *agent_ids())
 
 
-def agent_env():
+def agent_env(run_id=None):
     """The orchestrator's environment: model settings, the database and AGENT_* credentials only."""
     keep = ("ANTHROPIC_", "CLAUDE_CODE_", "DISABLE_", "AGENT_")
     env = {k: v for k, v in os.environ.items() if k.startswith(keep)}
@@ -218,7 +332,7 @@ def agent_env():
     home = DATA / "home"
     env.update(
         HOME=str(home), USER=AGENT_USER, LOGNAME=AGENT_USER, SHELL="/bin/bash", LANG="C.UTF-8",
-        DATA_DIR=str(DATA), PATH=f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        DATA_DIR=str(DATA), PATH=f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin", RUN_ID=str(run_id or ""),
     )
     return env
 
@@ -236,14 +350,14 @@ def kill_group(proc):
             pass
 
 
-def run_claude(prompt, resume=None):
-    """Runs one orchestrator turn. Returns (reply text, session id)."""
+def run_claude(prompt, resume=None, run_id=None):
+    """Runs one orchestrator turn. Returns (reply text, session id, status)."""
     cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json", "--permission-mode", "bypassPermissions",
            "--max-turns", MAX_TURNS]
     if resume:
         cmd += ["--resume", resume]
     proc = subprocess.Popen(
-        cmd, cwd=DATA / "workspace", env=agent_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, cwd=DATA / "workspace", env=agent_env(run_id), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, start_new_session=True, **as_agent(),
     )
     RUN["proc"], RUN["stopped"] = proc, False
@@ -252,11 +366,11 @@ def run_claude(prompt, resume=None):
     except subprocess.TimeoutExpired:
         kill_group(proc)
         proc.communicate()
-        return f"⚠️ Gave up after {JOB_TIMEOUT / 60:.0f} minutes without finishing.", resume
+        return f"⚠️ Gave up after {JOB_TIMEOUT / 60:.0f} minutes without finishing.", resume, "timed out"
     finally:
         RUN["proc"] = None
     if RUN["stopped"] or STOP.is_set():
-        return "", resume
+        return "", resume, "stopped"
     try:
         result = json.loads(out)
     except ValueError:
@@ -265,12 +379,13 @@ def run_claude(prompt, resume=None):
         except (ValueError, IndexError):
             if resume:  # e.g. the saved session can't be resumed; start a fresh one once
                 log("resume failed, retrying fresh:", (err or out)[-300:])
-                return run_claude(prompt)
-            return f"⚠️ Claude Code exited with {proc.returncode}: {(err or out).strip()[-600:]}", None
+                return run_claude(prompt, run_id=run_id)
+            return f"⚠️ Claude Code exited with {proc.returncode}: {(err or out).strip()[-600:]}", None, "failed"
     session = result.get("session_id")
     if result.get("is_error") or result.get("subtype") != "success":
-        return f"⚠️ {result.get('result') or result.get('subtype') or 'Claude Code reported an error'}", session
-    return result.get("result") or "", session
+        text = result.get("result") or result.get("subtype") or "Claude Code reported an error"
+        return f"⚠️ {text}", session, "failed"
+    return result.get("result") or "", session, "done"
 
 
 def run_precheck(command):
@@ -292,30 +407,19 @@ def chat_session():
     return saved["id"] if time.time() - saved["at"] < CHAT_IDLE_SECONDS else None
 
 
-def converse(prompt):
-    """A turn in the ongoing conversation with the owner (messages and worker reports)."""
-    reply, session = run_claude(prompt, resume=chat_session())
-    if session:
+def respond(kind, label, prompt, silent_ok, conversation=True):
+    """One recorded orchestrator turn; its reply is queued for the owner unless it chose SILENT."""
+    run_id = start_run(kind, label, prompt)
+    reply, session, status = run_claude(prompt, resume=chat_session() if conversation else None, run_id=run_id)
+    if conversation and session:
         SESSION_FILE.write_text(json.dumps({"id": session, "at": time.time()}))
-    return reply
-
-
-def drain_outbox(limit=15):
-    """Let the run's `notify` messages go out before its final reply."""
-    end = time.time() + limit
-    while any((DATA / "outbox").glob("*.json")) and time.time() < end:
-        time.sleep(0.5)
-
-
-def deliver(user, reply, silent_ok):
-    if STOP.is_set() or (silent_ok and reply.strip().strip(".").upper() == "SILENT"):
-        return
-    drain_outbox()
-    send_text(user, reply)
+    silent = silent_ok and status == "done" and reply.strip().strip(".").upper() == "SILENT"
+    finish_run(run_id, "silent" if silent else status, reply, session)
+    if not silent and status != "stopped":
+        queue_message(reply, run_id=run_id)
 
 
 def handle(job):
-    user = job["user"]
     note = ""
     if job.get("resumed"):
         note = "[The machine restarted while this was running. Check what was already done before repeating anything.]\n"
@@ -327,9 +431,9 @@ def handle(job):
         except OSError:
             pass
         prompt = note + f"[WhatsApp · {now_str()}]\n" + "\n".join(describe(m) for m in job["messages"])
-        deliver(user, converse(prompt), silent_ok=False)
+        respond("message", None, prompt, silent_ok=False)
     elif job["kind"] == "report":
-        deliver(user, converse(note + job["prompt"]), silent_ok=True)
+        respond("report", job["id"], note + job["prompt"], silent_ok=True)
     else:  # a scheduled task, in a session of its own
         extra = ""
         if job.get("precheck"):
@@ -338,8 +442,8 @@ def handle(job):
                 log(f"task {job['name']!r}: precheck found nothing, skipped")
                 return
             extra = f"\n\n[precheck exited {code}; output:]\n{output[-4000:]}"
-        reply, _ = run_claude(note + f"[Scheduled task “{job['name']}” · {now_str()}]\n{job['prompt']}{extra}")
-        deliver(user, reply, silent_ok=True)
+        prompt = note + f"[Scheduled task “{job['name']}” · {now_str()}]\n{job['prompt']}{extra}"
+        respond("task", job["name"], prompt, silent_ok=True, conversation=False)
 
 
 def mark_seen(key):
@@ -357,7 +461,7 @@ def enqueue(job):
     tmp.rename(DATA / "queue" / f"{time.time_ns()}.json")
 
 
-def stop_all(user):
+def stop_all():
     dropped = 0
     for queued in (DATA / "queue").glob("*.json"):
         queued.unlink(missing_ok=True)
@@ -367,14 +471,13 @@ def stop_all(user):
     if proc:
         RUN["stopped"] = True
         kill_group(proc)
-    send_text(user, "Stopped everything." + (f" Dropped {dropped} queued job(s)." if dropped else ""))
+    queue_message("Stopped everything." + (f" Dropped {dropped} queued job(s)." if dropped else ""))
 
 
 def accept(job):
     """Persists a job (crash-safe) after de-duplicating it; handles the /stop and /new commands."""
-    user = job["user"]
-    if user:
-        USER_FILE.write_text(user)
+    if job["user"]:
+        USER_FILE.write_text(job["user"])
     if job["kind"] != "messages":
         if mark_seen(job["id"]):
             enqueue(job)
@@ -385,14 +488,14 @@ def accept(job):
             continue
         command = msg["text"]["body"].strip().lower() if msg.get("type") == "text" else ""
         if command == "/stop":
-            stop_all(user)
+            stop_all()
         elif command == "/new":
             SESSION_FILE.unlink(missing_ok=True)
-            send_text(user, "Okay, starting a fresh conversation.")
+            queue_message("Okay, starting a fresh conversation.")
         else:
             fresh.append(msg)
     if fresh:
-        enqueue({"kind": "messages", "user": user, "messages": fresh})
+        enqueue({"kind": "messages", "user": job["user"], "messages": fresh})
 
 
 def run_jobs(threads):
@@ -415,69 +518,18 @@ def run_jobs(threads):
             handle(job)
         except Exception as e:  # noqa: BLE001 - one bad job must not take the bridge down
             log("job failed:", repr(e))
-            send_text(job.get("user"), f"⚠️ The bridge hit an error on that job: {e!r}")
+            queue_message(f"⚠️ The bridge hit an error on that job: {e!r}")
         finally:
             if not STOP.is_set():  # if we're being shut down, leave it to be resumed on next boot
                 running.unlink(missing_ok=True)
 
 
-def outbox_loop():
-    """Sends what the orchestrator queued with the `notify` command."""
-    agent_uid = agent_ids()[0] if os.geteuid() == 0 else os.geteuid()
-    while not STOP.is_set():
-        for item in sorted((DATA / "outbox").glob("*.json")):
-            user = owner()
-            try:
-                msg = json.loads(item.read_text())
-                if msg.get("file"):
-                    st = os.stat(msg["file"])
-                    if st.st_uid != agent_uid and not st.st_mode & 0o004:  # only files the agent could read
-                        raise PermissionError(f"{msg['file']} isn't readable by the agent")
-                    send_file(user, msg["file"], msg.get("text", ""))
-                else:
-                    send_text(user, msg.get("text", ""))
-            except Exception as e:  # noqa: BLE001
-                log("notify failed:", repr(e))
-                send_text(user, f"(notify failed: {e})")
-            item.unlink(missing_ok=True)
-        time.sleep(1)
-
-
 # ---------------------------------------------------------------- WhatsApp poller + schedule clock
 
-_db = None
 
-
-def sql(query, *args):
-    global _db
-    import psycopg
-
-    for attempt in range(2):
-        try:
-            if _db is None or _db.closed:
-                _db = psycopg.connect(
-                    os.environ["DATABASE_URL"], autocommit=True, prepare_threshold=None, connect_timeout=15
-                )
-            cursor = _db.execute(query, args)
-            return cursor.fetchall() if cursor.description else []
-        except psycopg.OperationalError:
-            _db = None
-            if attempt:
-                raise
-            time.sleep(2)
-
-
-def get_state(key):
-    rows = sql("select value from agent.bridge_state where key = %s", key)
-    return rows[0][0] if rows else None
-
-
-def set_state(key, value):
-    sql(
-        "insert into agent.bridge_state (key, value) values (%s, %s) "
-        "on conflict (key) do update set value = excluded.value, updated_at = now()",
-        key, str(value),
-    )
+def ensure_tables():
+    sql((APP / "supabase" / "tables.sql").read_text())  # idempotent: new tables ship with a deploy
+    TABLES_READY.set()
 
 
 def fire_due_schedules():
@@ -492,7 +544,7 @@ def fire_due_schedules():
             following = croniter(cron, datetime.now(ZoneInfo(tz))).get_next(datetime)
         except Exception as e:  # noqa: BLE001 - a bad cron or timezone written by the agent
             sql("update agent.schedules set enabled = false, last_error = %s where id = %s", f"disabled: {e}", sid)
-            send_text(owner(), f"⚠️ Schedule “{name}” was disabled: {e}")
+            queue_message(f"⚠️ Schedule “{name}” was disabled: {e}")
             continue
         if due is not None and owner():
             accept({"kind": "task", "user": owner(), "id": f"task:{sid}:{due.isoformat()}",
@@ -517,10 +569,11 @@ def poll_loop():
     heartbeat_url = os.environ.get("HEALTHCHECK_URL")
     while True:
         try:
+            ensure_tables()
             offset, since = load_offset()
             break
         except Exception as e:  # noqa: BLE001 - e.g. Postgres unreachable at boot; keep trying
-            log("can't read the WhatsApp offset from Postgres yet:", repr(e))
+            log("can't set up Postgres yet:", repr(e))
             time.sleep(15)
     last_tick = last_beat = 0.0
     log("polling WhatsApp")
@@ -547,6 +600,7 @@ def poll_loop():
                 if m.get("from", "").startswith("user:") and int(m.get("timestamp", 0)) >= since
             ]
             if messages:
+                record_inbound(messages)
                 accept({"kind": "messages", "user": messages[-1]["from"], "messages": messages})
             offset = data["next_offset"]
             set_state("wa_offset", offset)
@@ -608,21 +662,29 @@ def ensure_sprite():
             raise
 
 
-def worker_env():
+RESIDENTIAL_KEYS = ("BYTEFUL_PUBLIC_KEY", "BYTEFUL_PRIVATE_KEY")  # paid; only for jobs flagged --residential
+
+
+def worker_env(residential=False, run_id=None):
     """Exports for the worker's Claude: written per job, sourced and deleted by run.sh."""
     keep = ("ANTHROPIC_", "CLAUDE_CODE_", "DISABLE_", "AGENT_")
     names = sorted(k for k in os.environ if k.startswith(keep) or k in ("API_TIMEOUT_MS", "DATABASE_URL", "TZ"))
+    if residential:
+        names += [k for k in RESIDENTIAL_KEYS if k in os.environ]
     lines = [f"export {name}={shlex.quote(os.environ[name])}" for name in names]
-    lines += [f"export WORKER_TIMEOUT_SECONDS={int(WORKER_TIMEOUT)}", 'export PATH="$HOME/.local/bin:$PATH"']
+    lines += [f"export RUN_ID={shlex.quote(str(run_id or ''))}", f"export WORKER_TIMEOUT_SECONDS={int(WORKER_TIMEOUT)}",
+              'export PATH="$HOME/.local/bin:$PATH"']
     return "\n".join(lines) + "\n"
 
 
-def start_worker_job(job_id, brief):
+def start_worker_job(job_id, brief, residential=False, run_id=None):
     ensure_sprite()
     job = f"{SPRITE_ROOT}/jobs/{job_id}"
     for name in ("CLAUDE.md", "mcp.json", "provision.sh", "run.sh", "status.py"):
         sprite_write(f"{SPRITE_ROOT}/{name}", (APP / "worker" / name).read_bytes())
-    sprite_write(f"{SPRITE_ROOT}/.env", worker_env())
+    sprite_write(f"{SPRITE_ROOT}/.env", worker_env(residential, run_id))
+    if residential:
+        brief += "\n\n[The owner authorized a residential IP (Byteful) for this job; its keys are in your environment.]"
     sprite_write(f"{job}/BRIEF.md", brief)
     # Not retried: a failure can arrive after the job has started.
     sprite_sh(
@@ -651,17 +713,19 @@ def cancel_worker_job(job_id):
               f"|| echo 143 > exit_code")
 
 
-def report(job_id, text):
-    accept({"kind": "report", "user": owner(), "id": f"report:{job_id}", "prompt": text})
+def report(current, state, text):
+    """Ends the worker run and hands its report to the orchestrator as a new job."""
+    finish_run(current.get("run_id"), state, text)
+    header = f"[Worker report · job {current['id']} · run {current.get('run_id')} · {state}]"
+    accept({"kind": "report", "user": owner(), "id": f"report:{current['id']}", "prompt": f"{header}\n{text}"})
 
 
 def collect_worker_job(current, status):
     """Copies the job's output/ files here and hands the worker's report to the orchestrator."""
-    job_id = current["id"]
-    local = DATA / "worker" / job_id
+    local = DATA / "worker" / current["id"]
     names = []
     for name in status.get("outputs", [])[:20]:
-        data = sprite_read(f"{SPRITE_ROOT}/jobs/{job_id}/output/{name}")
+        data = sprite_read(f"{SPRITE_ROOT}/jobs/{current['id']}/output/{name}")
         if data is None or len(data) > 25 * 2**20:
             continue
         local.mkdir(parents=True, exist_ok=True)
@@ -672,13 +736,12 @@ def collect_worker_job(current, status):
         names.append(path.name)
     state = ("cancelled" if status.get("cancelled") else "timed out" if status.get("timed_out")
              else "finished" if status.get("exit_code") == 0 else "failed")
-    lines = [f"[Worker report · job {job_id} · {state}]", f"Brief: {current['brief'][:300]}", "",
-             status.get("final_message") or "(The worker sent no final message.)"]
+    lines = [f"Brief: {current['brief'][:300]}", "", status.get("final_message") or "(The worker sent no final message.)"]
     if names:
         lines += ["", f"Files copied to {local}/: {', '.join(names)}"]
     if state != "finished" and status.get("log_tail"):
         lines += ["", "[worker error output]", status["log_tail"][-1500:]]
-    report(job_id, "\n".join(lines))
+    report(current, state, "\n".join(lines))
 
 
 def worker_loop():
@@ -703,8 +766,7 @@ def worker_loop():
                     log("worker status:", repr(e))
                     status = {"state": "unknown"}
                 if status is None:
-                    report(current["id"], f"[Worker report · job {current['id']} · lost]\n"
-                                          "The job's files are gone from the worker.")
+                    report(current, "lost", "The job's files are gone from the worker.")
                     current = None
                 elif status["state"] == "finished":
                     collect_worker_job(current, status)
@@ -714,8 +776,7 @@ def worker_loop():
                         cancel_worker_job(current["id"])
                     except Exception:  # noqa: BLE001
                         pass
-                    report(current["id"], f"[Worker report · job {current['id']} · unresponsive]\n"
-                                          "The worker stopped responding, so the job was abandoned.")
+                    report(current, "unresponsive", "The worker stopped responding, so the job was abandoned.")
                     current = None
                 else:
                     current["progress"] = status.get("progress")
@@ -724,15 +785,16 @@ def worker_loop():
                 if pending:
                     request = json.loads(pending[0].read_text())
                     pending[0].unlink()
+                    residential = request.get("residential") is True
+                    candidate = {"id": request["id"], "brief": request["brief"], "residential": residential,
+                                 "started": time.time(), "progress": None,
+                                 "run_id": start_run("worker", request["id"], request["brief"])}
                     try:
-                        start_worker_job(request["id"], request["brief"])
-                        current = {"id": request["id"], "brief": request["brief"], "started": time.time(),
-                                   "progress": None}
-                        last_check = time.time()
+                        start_worker_job(request["id"], request["brief"], residential, candidate["run_id"])
+                        current, last_check = candidate, time.time()
                     except Exception as e:  # noqa: BLE001
                         log("worker start failed:", repr(e))
-                        report(request["id"], f"[Worker report · job {request['id']} · not started]\n"
-                                              f"The worker couldn't be started: {e}")
+                        report(candidate, "not started", f"The worker couldn't be started: {e}")
         except Exception as e:  # noqa: BLE001
             log("worker loop:", repr(e))
         if current:
@@ -746,12 +808,12 @@ def worker_loop():
 
 
 def prepare():
-    for sub in ("queue/running", "state/seen", "inbox", "outbox", "delegate", "worker", "workspace", "home/.claude"):
+    for sub in ("queue/running", "state/seen", "inbox", "delegate", "worker", "workspace", "home/.claude"):
         (DATA / sub).mkdir(parents=True, exist_ok=True)
     for name in ("CLAUDE.md", "settings.json"):  # infrastructure-owned; refreshed on every boot
         shutil.copy(APP / "agent" / name, DATA / "home" / ".claude" / name)
     if os.geteuid() == 0:
-        for sub in ("inbox", "outbox", "delegate", "worker", "workspace", "home", "home/.claude",
+        for sub in ("inbox", "delegate", "worker", "workspace", "home", "home/.claude",
                     "home/.claude/CLAUDE.md", "home/.claude/settings.json"):
             os.chown(DATA / sub, *agent_ids())
     cutoff = time.time() - 35 * 86400  # WhatsApp keeps updates 30 days
@@ -780,7 +842,7 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
     prepare()
     threads = [threading.Thread(target=loop, name=loop.__name__, daemon=True)
-               for loop in (poll_loop, outbox_loop, worker_loop)]
+               for loop in (poll_loop, sender_loop, worker_loop)]
     for thread in threads:
         thread.start()
     log("orchestrator ready")

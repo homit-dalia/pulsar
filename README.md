@@ -14,8 +14,12 @@ orchestrator   Fly Machine, shared-cpu-1x 512MB, always on (~$4/mo)
      ▼                             │
 worker         Fly Sprite "agent-worker" (created on first use, sleeps when idle)
   run.sh ── provisions once (Chrome, Xvfb, stealth MCP, pinned Claude Code) · runs `claude -p` on the brief
-Supabase       agent.bridge_state, agent.schedules, plus any tables either agent creates
+Supabase       agent.messages (every message, in and out) · agent.runs (every turn and job)
+               agent.events (what the agents did) · agent.schedules · plus any tables the agents create
+Storage        a private Supabase Storage bucket for files the agents keep (resumes, screenshots)
 ```
+
+Outbound messages are never sent directly. Both a reply and a `notify` become a `pending` row in `agent.messages`, and one sender thread delivers them in order, about once a second.
 
 | File | Purpose |
 |---|---|
@@ -23,12 +27,13 @@ Supabase       agent.bridge_state, agent.schedules, plus any tables either agent
 | `bridge.py` | The only real code: WhatsApp transport, schedule clock, job queue, worker sprite lifecycle |
 | `agent/CLAUDE.md` | Tells the orchestrator about its environment and the worker. No task instructions |
 | `worker/` | Copied into the sprite per job: its `CLAUDE.md`, MCP config, `provision.sh`, `run.sh`, `status.py` |
-| `notify`, `delegate` | Commands for the orchestrator: message you mid-task; hand a job to the worker |
-| `supabase/schema.sql` | Scoped role and the two tables the bridge needs |
+| `notify`, `delegate` | Commands for the orchestrator: queue a message to you; hand a job to the worker |
+| `supabase/schema.sql` | One-time setup: a scoped role and its `agent` schema |
+| `supabase/tables.sql` | The infrastructure's tables. The bridge applies them on every boot, so new ones ship with a deploy |
 
 ## Setup
 
-1. **Supabase.** Create a free project. In the SQL editor, run `supabase/schema.sql` after replacing the password. Open **Connect → Session pooler**, copy the URI, change the user from `postgres.<ref>` to `agent_rw.<ref>`, and fill in that password.
+1. **Supabase.** Create a free project. In the SQL editor, run `supabase/schema.sql` after replacing the password; the bridge creates the tables itself. For the connection string, use the URI from **Connect** with the user changed to `agent_rw` and that password. A pooler URI has a `.<ref>` suffix on the user, which you keep.
 2. **WhatsApp.** Settings → Agents → Create an agent → open its chat → Chat info → API key.
 3. **DeepSeek.** Create an API key and add some prepaid credit.
 4. **Sprites.** Create an API token for your Sprites organization at [sprites.dev](https://sprites.dev).
@@ -46,8 +51,31 @@ fly secrets set \
 fly tokens create deploy | gh secret set FLY_API_TOKEN   # the token goes straight into GitHub
 ```
 
-6. **Push to `main`.** `.github/workflows/deploy.yml` deploys every push to `main`, skipping pushes that only change README or `supabase/`. You can also run it from the Actions tab.
+6. **Push to `main`.** `.github/workflows/deploy.yml` deploys every push to `main`, skipping pushes that only change the README or `supabase/schema.sql`. You can also run it from the Actions tab.
 7. Send your agent a WhatsApp message. The first time the orchestrator delegates, the worker sprite is created and set up, which takes a few extra minutes.
+
+Optional: give the agents a mailbox, for example a new Gmail account with 2-Step Verification and an app password:
+
+```sh
+fly secrets set AGENT_EMAIL_ADDRESS='…' AGENT_EMAIL_PASSWORD='<app password>' \
+  AGENT_IMAP_HOST=imap.gmail.com AGENT_SMTP_HOST=smtp.gmail.com
+```
+
+Optional, but the agents' instructions expect it: file storage in a Supabase Storage bucket over its S3 protocol.
+1. In Storage, create a **private** bucket named `agent`.
+2. Under Storage settings → S3 access keys, create a key.
+3. Copy the endpoint and region from the same page, then:
+
+```sh
+fly secrets set AGENT_S3_ENDPOINT='https://<ref>.supabase.co/storage/v1/s3' AGENT_S3_REGION='<region>' AGENT_S3_BUCKET=agent \
+  AGENT_S3_ACCESS_KEY_ID='…' AGENT_S3_SECRET_ACCESS_KEY='…'
+```
+
+Optional: a paid residential-IP proxy (Byteful). These keys deliberately have no `AGENT_` prefix, so neither agent sees them by default. The bridge hands them to a single worker job only when the orchestrator delegates it with `--residential`, and the orchestrator is told to do that only when you explicitly ask:
+
+```sh
+fly secrets set BYTEFUL_PUBLIC_KEY='…' BYTEFUL_PRIVATE_KEY='…'
+```
 
 Optional: set `HEALTHCHECK_URL` (for example a free healthchecks.io check with a 10-minute period). The bridge pings it every 5 minutes, so you'll know if the orchestrator stops.
 
@@ -58,6 +86,11 @@ Optional: set `HEALTHCHECK_URL` (for example a free healthchecks.io check with a
 - Logs: `fly logs -a <app>`. Shell: `fly ssh console -a <app>`. The worker: `sprite console agent-worker`, or look under `/workspace/agent/jobs/`.
 - To change the model or effort level, edit `[env]` in `fly.toml` and push. Those settings apply to both agents.
 - A deploy restarts the orchestrator. A turn that was in progress is re-run after the restart, and a worker job carries on in the sprite.
+- To see what happened, look in Supabase (Table Editor → schema `agent`):
+  - `messages` has the conversation.
+  - `runs` has every orchestrator turn and worker job, with its input, output and status.
+  - `events` has what the agents logged along the way.
+  - Any task-specific tables the agents created are in the same schema.
 
 ## Costs
 
