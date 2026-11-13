@@ -1,0 +1,47 @@
+# The orchestrator: one small machine, always on (~$4/month). It runs the bridge and the
+# orchestrator Claude. Heavy work goes to a single Fly Sprite that the bridge creates on
+# first use and that sleeps when idle (see worker/).
+# Deployed by .github/workflows/deploy.yml on every push to main.
+
+app = "agent-orchestrator-r2ui"   # Fly app names are global; change it if this one is taken
+primary_region = "iad"
+swap_size_mb = 1024
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  TZ = "America/New_York"
+  SPRITE_NAME = "agent-worker"
+  JOB_TIMEOUT_MINUTES = "30"      # one orchestrator turn
+  WORKER_TIMEOUT_MINUTES = "60"   # one worker job
+  # Claude Code -> DeepSeek, per https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code
+  # These also go to the worker's Claude.
+  ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+  ANTHROPIC_MODEL = "deepseek-flash[1m]"
+  ANTHROPIC_DEFAULT_FABLE_MODEL = "deepseek-flash[1m]"
+  ANTHROPIC_DEFAULT_OPUS_MODEL = "deepseek-flash[1m]"
+  ANTHROPIC_DEFAULT_SONNET_MODEL = "deepseek-flash[1m]"
+  ANTHROPIC_DEFAULT_HAIKU_MODEL = "deepseek-flash"
+  CLAUDE_CODE_SUBAGENT_MODEL = "deepseek-flash"
+  CLAUDE_CODE_EFFORT_LEVEL = "max"
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS = "1000000"  # Claude Code doesn't recognise DeepSeek model ids
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW = "786432"
+  API_TIMEOUT_MS = "600000"
+  DISABLE_UPDATES = "1"
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"   # Claude Code idles at ~230MB; use "1gb" if turns get slow
+
+[[mounts]]
+  source = "agent_data"
+  destination = "/data"
+  initial_size = "1gb"
+  auto_extend_size_threshold = 80
+  auto_extend_size_increment = "1GB"
+  auto_extend_size_limit = "5GB"
+
+[[restart]]
+  policy = "always"

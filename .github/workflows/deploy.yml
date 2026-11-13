@@ -1,0 +1,27 @@
+# Deploys the orchestrator to Fly.io on every push to main, or on demand from the Actions tab.
+# Needs one repository secret, FLY_API_TOKEN: a deploy token for the app (README → Setup).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["README.md", "supabase/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200  # master, 2026-10-30
+      - run: flyctl deploy --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

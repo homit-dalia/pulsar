@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "stealth-chrome": {
+      "command": "mcp-stealth-chrome"
+    }
+  }
+}
