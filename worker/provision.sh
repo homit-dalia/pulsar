@@ -23,6 +23,8 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 command -v uv > /dev/null || curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh
 UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install --force "mcp-stealth-chrome==0.11.0"
+# The sprite's default python3 is its own pyenv build, not Ubuntu's; give it boto3 as well.
+python3 -m pip install --user --quiet "boto3==1.40.*"
 # The installer honours DISABLE_UPDATES, which would leave the sprite's preinstalled version in place.
 curl -fsSL https://claude.ai/install.sh | env -u DISABLE_UPDATES bash -s 2.1.311
 "$HOME/.local/bin/claude" --version
