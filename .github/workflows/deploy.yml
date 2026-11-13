@@ -5,7 +5,7 @@ name: Deploy
 on:
   push:
     branches: [main]
-    paths-ignore: ["README.md", "supabase/schema.sql"]
+    paths-ignore: ["README.md", "supabase/schema.sql", "tests/**"]
   workflow_dispatch:
 
 concurrency:

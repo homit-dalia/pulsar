@@ -1,23 +1,28 @@
 #!/bin/sh
-# Hand a job to the worker (a Fly Sprite with its own Claude and a stealth browser).
-#   delegate "brief"                queue a job; its report arrives later as a [Worker report] run
+# Hand a job to the worker (a Fly Sprite with its own Claude and a stealth browser). Jobs queue as
+# rows in agent.runs (kind 'worker'); the bridge runs them one at a time, retrying infrastructure
+# failures, and the report comes back as a [Worker report] run.
+#   delegate "brief"                queue a job
 #   delegate --file PATH            same, with the brief read from a file
 #   delegate --residential ...      also give this one job the owner's paid residential-IP keys
-#   delegate --status               what the worker is doing, and how many jobs are queued
+#   delegate --status               the worker's current and queued jobs
 #   delegate --cancel               stop the current job and drop queued ones
 set -eu
-data="${DATA_DIR:-/data}"
-dir="$data/delegate"
+q() { PGTZ="${TZ:-UTC}" psql "$DATABASE_URL" -X -q -At -v ON_ERROR_STOP=1 "$@"; }
 residential=false
 if [ "${1:-}" = "--residential" ]; then residential=true; shift; fi
 case "${1:-}" in
   --status)
-    if [ -f "$data/state/worker.json" ]; then cat "$data/state/worker.json"; echo; else echo "The worker is idle."; fi
-    echo "Queued jobs: $(find "$dir" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')"
+    q -c "select format('run %s · job %s · %s · since %s%s · brief: %s%s', id, label, status, to_char(started_at, 'Mon DD HH24:MI'),
+                        case when attempts > 1 then format(' · attempt %s', attempts) else '' end,
+                        left(regexp_replace(input, '\s+', ' ', 'g'), 100), coalesce(' · now: ' || progress, ''))
+          from agent.runs where kind = 'worker' and status in ('running', 'cancel_requested', 'queued') order by id" \
+      | grep . || echo "The worker is idle and nothing is queued."
     exit 0 ;;
   --cancel)
-    : > "$dir/cancel"
-    echo "Cancelling the worker's job and any queued ones."
+    q -c "update agent.runs set status = 'cancelled', finished_at = now() where kind = 'worker' and status = 'queued'" \
+      -c "update agent.runs set status = 'cancel_requested' where kind = 'worker' and status = 'running'"
+    echo "Cancelling the worker's job and dropping queued ones. The cancelled job still sends a report."
     exit 0 ;;
   --file) brief=$(cat "$2") ;;
   "") echo 'usage: delegate [--residential] "brief" | delegate [--residential] --file PATH | delegate --status | delegate --cancel' >&2; exit 2 ;;
@@ -25,8 +30,11 @@ case "${1:-}" in
 esac
 [ -n "$brief" ] || { echo "delegate: the brief is empty" >&2; exit 2; }
 id="$(date +%Y%m%d-%H%M%S)-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
-tmp=$(mktemp "$dir/.request.XXXXXX")
-jq -n --arg id "$id" --arg brief "$brief" --argjson residential "$residential" \
-  '{id: $id, brief: $brief, residential: $residential}' > "$tmp"
-mv "$tmp" "$dir/$id.json"
-echo "Queued worker job $id$([ "$residential" = true ] && echo ' (residential IP)'). Its report will arrive as a [Worker report] run; nothing more to do now."
+run=$(q -v id="$id" -v brief="$brief" -v residential="$residential" -v parent="${RUN_ID:-}" <<'SQL'
+insert into agent.runs (kind, label, input, status, meta)
+values ('worker', :'id', :'brief', 'queued',
+        jsonb_build_object('residential', :'residential'::boolean, 'requested_by', nullif(:'parent', '')::bigint))
+returning id;
+SQL
+)
+echo "Queued worker job $id as run $run$([ "$residential" = true ] && echo ' (residential IP)'). Its report will arrive as a [Worker report] run; nothing more to do now."

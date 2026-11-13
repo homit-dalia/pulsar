@@ -10,8 +10,8 @@ you ⇄ WhatsApp ⇄ api.whatsapp.com/agent/v1 (long-poll)
 orchestrator   Fly Machine, shared-cpu-1x 512MB, always on (~$4/mo)
   bridge.py ── polls WhatsApp · fires agent.schedules · runs `claude -p` one job at a time
   claude    ── chat, light web lookups, scheduling, deciding what to tell you
-     │ delegate "brief"            ▲ [Worker report …] + output files
-     ▼                             │
+     │ delegate "brief"            ▲ [Worker report …] + output files + step log
+     ▼ (queued in agent.runs)      │
 worker         Fly Sprite "agent-worker" (created on first use, sleeps when idle)
   run.sh ── provisions once (Chrome, Xvfb, stealth MCP, pinned Claude Code) · runs `claude -p` on the brief
 Supabase       agent.messages (every message, in and out) · agent.runs (every turn and job)
@@ -19,7 +19,11 @@ Supabase       agent.messages (every message, in and out) · agent.runs (every t
 Storage        a private Supabase Storage bucket for files the agents keep (resumes, screenshots)
 ```
 
-Outbound messages are never sent directly. Both a reply and a `notify` become a `pending` row in `agent.messages`, and one sender thread delivers them in order, about once a second.
+How the bridge keeps things moving:
+- **Outbound messages.** Nothing is sent directly. Both a reply and a `notify` become a `pending` row in `agent.messages`, and one sender thread delivers them in order, about once a second. A send that fails temporarily is retried with backoff, and nothing behind it overtakes it.
+- **Orchestrator jobs.** They run one at a time. Your messages go first, then worker reports, then scheduled tasks. Messages you send in quick succession are merged into one turn. A turn that hits a temporary model or API error is retried up to 3 times; each retry resumes the same session, so it carries on rather than starting over. A schedule whose previous run is still waiting doesn't pile up.
+- **Worker jobs.** They queue as rows in `agent.runs` (`kind = 'worker'`) and run one at a time. Failed starts and failed provisioning are retried with backoff, up to 3 attempts. A job past its time limit is stopped, and every outcome, including cancelled, timed out and failed, comes back to the orchestrator as a report.
+- **Records.** Every run keeps a step log, token usage and a full transcript, so the orchestrator can answer "what exactly did you do?".
 
 | File | Purpose |
 |---|---|
@@ -30,6 +34,7 @@ Outbound messages are never sent directly. Both a reply and a `notify` become a 
 | `notify`, `delegate` | Commands for the orchestrator: queue a message to you; hand a job to the worker |
 | `supabase/schema.sql` | One-time setup: a scoped role and its `agent` schema |
 | `supabase/tables.sql` | The infrastructure's tables. The bridge applies them on every boot, so new ones ship with a deploy |
+| `tests/` | End-to-end test (`tests/run.sh`, about 10 minutes, needs Docker): the real bridge against fake WhatsApp and Sprites APIs and stand-in Claudes |
 
 ## Setup
 
@@ -81,7 +86,10 @@ Optional: set `HEALTHCHECK_URL` (for example a free healthchecks.io check with a
 
 ## Using it
 
-- Talk to it in WhatsApp. `/stop` stops everything: the orchestrator's current job, its queue, and the worker's job. `/new` starts a fresh conversation, which also happens automatically after 6 hours of silence.
+- Talk to it in WhatsApp. Three commands are handled by the bridge itself, without the model:
+  - `/status` shows what's running, what's queued, the worker's progress, and the next schedules.
+  - `/stop` stops everything: the orchestrator's current job, its queue, and the worker's job.
+  - `/new` starts a fresh conversation, which also happens automatically after 6 hours of silence.
 - To give the agents a credential: `fly secrets set AGENT_SOMETHING=... -a <app>`, then tell the orchestrator the variable name. Both agents get `AGENT_*` variables. Never paste secrets into the chat.
 - Logs: `fly logs -a <app>`. Shell: `fly ssh console -a <app>`. The worker: `sprite console agent-worker`, or look under `/workspace/agent/jobs/`.
 - To change the model or effort level, edit `[env]` in `fly.toml` and push. Those settings apply to both agents.

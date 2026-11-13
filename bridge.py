@@ -4,13 +4,17 @@
 A single process on one small, always-on Fly Machine:
   * long-polls the WhatsApp Agent Platform and queues the owner's messages
   * fires due rows of agent.schedules (Postgres)
-  * runs the orchestrator (`claude -p`), one job at a time
-  * runs what the orchestrator `delegate`s on one Fly Sprite, which has its own Claude and a
-    browser and sleeps when idle; each job's report comes back to the orchestrator as a new job
-  * records every run in agent.runs and every message in agent.messages. Outbound messages are
-    only ever queued there, and one sender delivers them in order
+  * runs the orchestrator (`claude -p`), one job at a time: the owner's messages first, then
+    worker reports, then scheduled tasks; quick follow-up messages are merged into one turn
+  * runs the jobs the orchestrator `delegate`s on one Fly Sprite, which has its own Claude and a
+    browser and sleeps when idle. They queue in agent.runs, and each report comes back to the
+    orchestrator as a new job
+  * records every run (with a step log) in agent.runs and every message in agent.messages.
+    Outbound messages are only ever queued there, and one sender delivers them in order
 
-No agent logic lives here: the agents' instructions are agent/CLAUDE.md and worker/CLAUDE.md.
+Transient failures are retried: model/API errors in a turn (resuming the same session),
+worker starts and provisioning, and WhatsApp sends. No agent logic lives here: the agents'
+instructions are agent/CLAUDE.md and worker/CLAUDE.md.
 
 WhatsApp Agent Platform: https://www.whatsapp.com/developer/WhatsApp-Agent-Platform-Developer-Manual.pdf
 Sprites API: https://docs.sprites.dev
@@ -22,6 +26,7 @@ import json
 import mimetypes
 import os
 import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -50,13 +55,20 @@ JOB_TIMEOUT = float(os.environ.get("JOB_TIMEOUT_MINUTES", "30")) * 60
 WORKER_TIMEOUT = float(os.environ.get("WORKER_TIMEOUT_MINUTES", "60")) * 60
 CHAT_IDLE_SECONDS = float(os.environ.get("CHAT_SESSION_IDLE_HOURS", "6")) * 3600
 MAX_TURNS = os.environ.get("MAX_TURNS", "100")
+RETRY_SECONDS = float(os.environ.get("RETRY_BASE_SECONDS", "30"))  # base for every backoff below
+TURN_ATTEMPTS, WORKER_ATTEMPTS, SEND_ATTEMPTS = 3, 3, 6
 
 STOP = threading.Event()
 TABLES_READY = threading.Event()
-RUN = {"proc": None, "stopped": False}
+RUN = {"proc": None, "stopped": False, "timed_out": False, "job": None}
 SESSION_FILE = DATA / "state" / "chat_session.json"
 USER_FILE = DATA / "state" / "wa_user"
-WORKER_STATE = DATA / "state" / "worker.json"
+PRIORITY = {"messages": 0, "report": 1, "task": 2}
+
+# An error worth retrying, unless it's one of the permanent ones (bad key, no balance).
+TRANSIENT = re.compile(r"overload|rate.?limit|\b429\b|\b5\d\d\b|time[d ]?out|temporar|unavailable|connection|"
+                       r"network|econn|socket|reset by peer|api error|internal server error", re.I)
+PERMANENT = re.compile(r"insufficient|balance|\b40[123]\b|invalid.{0,20}(key|token)|authenticat|unauthori", re.I)
 
 
 def log(*parts):
@@ -65,6 +77,15 @@ def log(*parts):
 
 def now_str():
     return datetime.now().astimezone().strftime("%a %Y-%m-%d %H:%M %Z")
+
+
+def clip(text, limit):
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def transient(error):
+    return bool(TRANSIENT.search(error or "")) and not PERMANENT.search(error or "")
 
 
 def http(method, url, body=None, headers=None, timeout=60):
@@ -125,22 +146,29 @@ def set_state(key, value):
     )
 
 
-def start_run(kind, label, text):
-    """Records the start of an orchestrator turn or worker job; returns its id (None if Postgres is down)."""
+def jsonb(value):
+    return None if value is None else json.dumps(value)
+
+
+def start_run(kind, label, text, meta=None):
+    """Records the start of an orchestrator turn; returns its id (None if Postgres is down)."""
     try:
-        return sql("insert into agent.runs (kind, label, input) values (%s, %s, %s) returning id",
-                   kind, label, text[:50000])[0][0]
+        return sql("insert into agent.runs (kind, label, input, meta) values (%s, %s, %s, %s::jsonb) returning id",
+                   kind, label, text[:50000], jsonb(meta or {}))[0][0]
     except Exception as e:  # noqa: BLE001 - telemetry must never block the work
         log("run not recorded:", repr(e))
         return None
 
 
-def finish_run(run_id, status, output="", session=None):
+def finish_run(run_id, status, output="", session=None, steps=None, usage=None, attempts=None, meta=None):
     if run_id is None:
         return
     try:
         sql("update agent.runs set status = %s, output = %s, session_id = coalesce(%s, session_id), "
-            "finished_at = now() where id = %s", status, (output or "")[:50000], session, run_id)
+            "steps = coalesce(%s::jsonb, steps), usage = coalesce(%s::jsonb, usage), "
+            "attempts = coalesce(%s, attempts), meta = meta || coalesce(%s::jsonb, '{}'), finished_at = now() "
+            "where id = %s",
+            status, (output or "")[:50000], session, jsonb(steps), jsonb(usage), attempts, jsonb(meta), run_id)
     except Exception as e:  # noqa: BLE001
         log("run not updated:", repr(e))
 
@@ -155,33 +183,35 @@ def wa(method, path, body=None, headers=None, timeout=60):
     return http(method, WA_API + path, body, headers, timeout)
 
 
+def whatsapp_format(text):
+    """Turns the Markdown models like to write into WhatsApp's own formatting."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+    text = re.sub(r"(?m)^#{1,6}\s+(.+?)\s*#*\s*$", r"*\1*", text)
+    return re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1 (\2)", text)
+
+
 def _send(payload):
-    """POST /messages with the manual's retry rules. Returns (message id, error)."""
-    error = None
-    for attempt in range(4):
-        try:
-            status, response = wa("POST", "/messages", payload, timeout=120)
-        except OSError as e:  # outcome unknown; retrying could send it twice
-            return None, f"network error: {e}"
-        if status == 200:
-            return json.loads(response)["messages"][0]["id"], None
-        error = f"HTTP {status}: {response[:300]!r}"
-        if status not in (429, 503):
-            break
-        time.sleep(5 * 2**attempt)
-    log("send failed:", error)
-    return None, error
+    """One POST /messages. Returns (message id, error, retryable)."""
+    try:
+        status, response = wa("POST", "/messages", payload, timeout=120)
+    except OSError as e:  # outcome unknown: a retry may duplicate, which beats losing it
+        return None, f"network error: {e}", True
+    if status == 200:
+        return json.loads(response)["messages"][0]["id"], None, False
+    return None, f"HTTP {status}: {response[:300]!r}", status == 429 or status >= 500
 
 
 def send_text(user, text):
-    wamid, error = None, "empty message"
+    text = whatsapp_format(text)
+    result = (None, "empty message", False)
     with SEND_LOCK:
         for i in range(0, len(text), 4000):
             payload = {"messaging_product": "whatsapp", "to": user, "type": "text", "text": {"body": text[i : i + 4000]}}
-            wamid, error = _send(payload)
-            if not wamid:
+            result = _send(payload)
+            if not result[0]:
                 break
-    return wamid, error
+    return result
 
 
 def send_file(user, path, caption=""):
@@ -197,12 +227,15 @@ def send_file(user, path, caption=""):
         f"Content-Type: {mime}\r\n\r\n"
     ).encode() + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
     content_type = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
-    status, response = wa("POST", "/media", body, content_type, timeout=300)
+    try:
+        status, response = wa("POST", "/media", body, content_type, timeout=300)
+    except OSError as e:
+        return None, f"upload network error: {e}", True
     if status != 200:
-        return None, f"upload failed with HTTP {status}: {response[:300]!r}"
+        return None, f"upload failed with HTTP {status}: {response[:300]!r}", status == 429 or status >= 500
     media = {"id": json.loads(response)["id"]}
     if caption and kind != "audio":
-        media["caption"] = caption[:1024]
+        media["caption"] = whatsapp_format(caption)[:1024]
     if kind == "document":
         media["filename"] = name
     with SEND_LOCK:
@@ -210,18 +243,18 @@ def send_file(user, path, caption=""):
 
 
 def deliver_now(user, body, file_path=None):
-    """Sends one message to the owner; returns (message id, error)."""
+    """Sends one message to the owner; returns (message id, error, retryable)."""
     if not user:
-        return None, "the owner hasn't messaged yet"
+        return None, "the owner hasn't messaged yet", True
     if not file_path:
         return send_text(user, body)
     try:
         st = os.stat(file_path)
     except OSError as e:
-        return None, str(e)
+        return None, str(e), False
     agent_uid = agent_ids()[0] if os.geteuid() == 0 else os.geteuid()
     if st.st_uid != agent_uid and not st.st_mode & 0o004:  # only files the agent could read itself
-        return None, f"{file_path} isn't readable by the agent"
+        return None, f"{file_path} isn't readable by the agent", False
     return send_file(user, file_path, body)
 
 
@@ -239,17 +272,29 @@ def queue_message(text="", file_path=None, run_id=None):
 
 
 def sender_loop():
-    """Delivers queued outbound messages one at a time, in order, about once a second."""
+    """Delivers queued outbound messages strictly in order, about once a second. A message that
+    fails transiently is retried with backoff, and nothing behind it overtakes it."""
     TABLES_READY.wait()
     while not STOP.is_set():
         try:
             user = owner()
-            rows = sql("select id, body, file_path from agent.messages where direction = 'out' "
-                       "and status = 'pending' order by id limit 20") if user else []
-            for mid, body, file_path in rows:
-                wamid, error = deliver_now(user, body, file_path)
-                sql("update agent.messages set status = %s, wa_message_id = %s, error = %s, sent_at = now() "
-                    "where id = %s", "sent" if wamid else "failed", wamid, error, mid)
+            rows = sql("select id, body, file_path, attempts, next_attempt_at <= now() or next_attempt_at is null "
+                       "from agent.messages where direction = 'out' and status = 'pending' order by id limit 20") if user else []
+            for mid, body, file_path, attempts, due in rows:
+                if not due:
+                    break
+                wamid, error, retryable = deliver_now(user, body, file_path)
+                if wamid:
+                    sql("update agent.messages set status = 'sent', wa_message_id = %s, error = null, sent_at = now(), "
+                        "attempts = attempts + 1 where id = %s", wamid, mid)
+                elif retryable and attempts + 1 < SEND_ATTEMPTS:
+                    delay = RETRY_SECONDS / 2 * 2**attempts
+                    sql("update agent.messages set attempts = attempts + 1, error = %s, "
+                        "next_attempt_at = now() + make_interval(secs => %s) where id = %s", error, delay, mid)
+                    break
+                else:
+                    sql("update agent.messages set status = 'failed', error = %s, attempts = attempts + 1 where id = %s",
+                        error, mid)
             time.sleep(1)
         except Exception as e:  # noqa: BLE001
             log("sender:", repr(e))
@@ -306,7 +351,23 @@ def describe(msg):
     return f"[{label} saved to {path}{caption}]{quoted}"
 
 
-# ---------------------------------------------------------------- orchestrator jobs
+def keep_typing(wamid):
+    """Refreshes the typing indicator (it lapses after 25s) until the returned event is set."""
+    done = threading.Event()
+
+    def loop():
+        while not done.wait(20):
+            try:
+                wa("POST", "/statuses", {"messaging_product": "whatsapp", "status": "read", "message_id": wamid,
+                                         "typing_indicator": {"type": "text"}})
+            except OSError:
+                pass
+
+    threading.Thread(target=loop, daemon=True).start()
+    return done
+
+
+# ---------------------------------------------------------------- orchestrator turns
 
 
 def agent_ids():
@@ -350,42 +411,81 @@ def kill_group(proc):
             pass
 
 
+def summarize_stream(lines, limit=300, detail=500):
+    """Reads Claude Code's stream-json events: (steps, final result event, session id)."""
+    steps, result, session = [], None, None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        session = event.get("session_id") or session
+        kind = event.get("type")
+        if kind == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    steps.append({"text": clip(block["text"].strip(), detail)})
+                elif block.get("type") == "tool_use":
+                    steps.append({"tool": block.get("name"), "input": clip(json.dumps(block.get("input")), detail)})
+        elif kind == "user":
+            for block in event.get("message", {}).get("content", []) or []:
+                if isinstance(block, dict) and block.get("is_error"):
+                    steps.append({"error": clip(block.get("content"), detail)})
+        elif kind == "result":
+            result = event
+    return steps[-limit:], result, session
+
+
 def run_claude(prompt, resume=None, run_id=None):
-    """Runs one orchestrator turn. Returns (reply text, session id, status)."""
-    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json", "--permission-mode", "bypassPermissions",
-           "--max-turns", MAX_TURNS]
+    """Runs one orchestrator turn. Returns (reply, session, status, steps, usage). The full event
+    stream is kept in /data/runs/<run id>.jsonl so the agent can look back at exactly what it did."""
+    transcript = DATA / "runs" / f"{run_id or 'norun-' + uuid.uuid4().hex[:8]}.jsonl"
+    start = transcript.stat().st_size if transcript.exists() else 0
+    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "bypassPermissions", "--max-turns", MAX_TURNS]
     if resume:
         cmd += ["--resume", resume]
-    proc = subprocess.Popen(
-        cmd, cwd=DATA / "workspace", env=agent_env(run_id), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True, **as_agent(),
-    )
-    RUN["proc"], RUN["stopped"] = proc, False
-    try:
-        out, err = proc.communicate(timeout=JOB_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        kill_group(proc)
-        proc.communicate()
-        return f"⚠️ Gave up after {JOB_TIMEOUT / 60:.0f} minutes without finishing.", resume, "timed out"
-    finally:
-        RUN["proc"] = None
-    if RUN["stopped"] or STOP.is_set():
-        return "", resume, "stopped"
-    try:
-        result = json.loads(out)
-    except ValueError:
+    with transcript.open("a") as out, transcript.with_suffix(".err").open("a") as err:
+        proc = subprocess.Popen(cmd, cwd=DATA / "workspace", env=agent_env(run_id), stdout=subprocess.PIPE,
+                                stderr=err, text=True, start_new_session=True, **as_agent())
+        RUN.update(proc=proc, stopped=False, timed_out=False)
+
+        def on_timeout():
+            RUN["timed_out"] = True
+            kill_group(proc)
+
+        timer = threading.Timer(JOB_TIMEOUT, on_timeout)
+        timer.start()
         try:
-            result = json.loads(out.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            if resume:  # e.g. the saved session can't be resumed; start a fresh one once
-                log("resume failed, retrying fresh:", (err or out)[-300:])
-                return run_claude(prompt, run_id=run_id)
-            return f"⚠️ Claude Code exited with {proc.returncode}: {(err or out).strip()[-600:]}", None, "failed"
-    session = result.get("session_id")
+            for line in proc.stdout:
+                if '"thinking_tokens"' not in line[:200]:  # skip the token-count ticker
+                    out.write(line)
+            proc.wait()
+        finally:
+            timer.cancel()
+            RUN["proc"] = None
+    give_to_agent(transcript)
+    with transcript.open() as f:
+        f.seek(start)
+        steps, result, session = summarize_stream(f)
+    if RUN["stopped"] or STOP.is_set():
+        return "", session or resume, "stopped", steps, None
+    if RUN["timed_out"]:
+        return f"⚠️ Gave up after {JOB_TIMEOUT / 60:.0f} minutes without finishing.", session or resume, "timed out", steps, None
+    if result is None:
+        error = transcript.with_suffix(".err").read_text(errors="replace")[-600:].strip()
+        if resume and (not steps) and re.search(r"no conversation found|session", error, re.I):
+            log("resume failed, retrying fresh:", error[-300:])  # e.g. the saved session is gone
+            return run_claude(prompt, run_id=run_id)
+        return f"⚠️ Claude Code exited with {proc.returncode}: {error}", session, "failed", steps, None
+    usage = {**(result.get("usage") or {}), "num_turns": result.get("num_turns"), "duration_ms": result.get("duration_ms")}
+    usage = {k: v for k, v in usage.items() if k in ("input_tokens", "cache_read_input_tokens", "output_tokens",
+                                                     "num_turns", "duration_ms")}
+    session = result.get("session_id") or session
     if result.get("is_error") or result.get("subtype") != "success":
         text = result.get("result") or result.get("subtype") or "Claude Code reported an error"
-        return f"⚠️ {text}", session, "failed"
-    return result.get("result") or "", session, "done"
+        return f"⚠️ {text}", session, "failed", steps, usage
+    return result.get("result") or "", session, "done", steps, usage
 
 
 def run_precheck(command):
@@ -407,14 +507,39 @@ def chat_session():
     return saved["id"] if time.time() - saved["at"] < CHAT_IDLE_SECONDS else None
 
 
-def respond(kind, label, prompt, silent_ok, conversation=True):
-    """One recorded orchestrator turn; its reply is queued for the owner unless it chose SILENT."""
+def respond(kind, label, prompt, silent_ok, conversation=True, typing_for=None):
+    """One recorded orchestrator turn. A turn that fails on a transient model/API error is retried
+    by resuming its session, so it carries on rather than starting over. The reply is queued for
+    the owner unless the orchestrator chose SILENT."""
     run_id = start_run(kind, label, prompt)
-    reply, session, status = run_claude(prompt, resume=chat_session() if conversation else None, run_id=run_id)
-    if conversation and session:
-        SESSION_FILE.write_text(json.dumps({"id": session, "at": time.time()}))
+    resume = chat_session() if conversation else None
+    typing = keep_typing(typing_for) if typing_for else None
+    all_steps, attempt, text = [], 0, prompt
+    try:
+        while True:
+            attempt += 1
+            reply, session, status, steps, usage = run_claude(text, resume, run_id)
+            all_steps += steps
+            if conversation and session:
+                SESSION_FILE.write_text(json.dumps({"id": session, "at": time.time()}))
+            if status != "failed" or attempt >= TURN_ATTEMPTS or not transient(reply) or STOP.is_set():
+                break
+            log(f"run {run_id}: transient failure, retrying ({attempt}/{TURN_ATTEMPTS}):", clip(reply, 200))
+            time.sleep(RETRY_SECONDS * attempt * attempt)
+            if session:
+                resume = session
+                text = (f"[Your previous attempt stopped with an error: {clip(reply, 300)} Carry on from where you "
+                        "left off, without redoing steps that already succeeded.]")
+    except Exception as e:
+        finish_run(run_id, "failed", f"bridge error: {e!r}", attempts=attempt)
+        raise
+    finally:
+        if typing:
+            typing.set()
     silent = silent_ok and status == "done" and reply.strip().strip(".").upper() == "SILENT"
-    finish_run(run_id, "silent" if silent else status, reply, session)
+    transcript = str(DATA / "runs" / f"{run_id}.jsonl") if run_id else None
+    finish_run(run_id, "silent" if silent else status, reply, session, all_steps[-300:], usage, attempt,
+               {"transcript": transcript})
     if not silent and status != "stopped":
         queue_message(reply, run_id=run_id)
 
@@ -424,14 +549,14 @@ def handle(job):
     if job.get("resumed"):
         note = "[The machine restarted while this was running. Check what was already done before repeating anything.]\n"
     if job["kind"] == "messages":
-        read = {"messaging_product": "whatsapp", "status": "read", "message_id": job["messages"][-1]["id"],
-                "typing_indicator": {"type": "text"}}
+        last = job["messages"][-1]["id"]
         try:
-            wa("POST", "/statuses", read)
+            wa("POST", "/statuses", {"messaging_product": "whatsapp", "status": "read", "message_id": last,
+                                     "typing_indicator": {"type": "text"}})
         except OSError:
             pass
         prompt = note + f"[WhatsApp · {now_str()}]\n" + "\n".join(describe(m) for m in job["messages"])
-        respond("message", None, prompt, silent_ok=False)
+        respond("message", None, prompt, silent_ok=False, typing_for=last)
     elif job["kind"] == "report":
         respond("report", job["id"], note + job["prompt"], silent_ok=True)
     else:  # a scheduled task, in a session of its own
@@ -461,12 +586,30 @@ def enqueue(job):
     tmp.rename(DATA / "queue" / f"{time.time_ns()}.json")
 
 
+def queued_jobs():
+    jobs = []
+    for path in sorted((DATA / "queue").glob("*.json")):
+        try:
+            jobs.append((path, json.loads(path.read_text())))
+        except (OSError, ValueError):
+            continue
+    return jobs
+
+
+def cancel_worker_jobs():
+    sql("update agent.runs set status = 'cancelled', finished_at = now() where kind = 'worker' and status = 'queued'")
+    sql("update agent.runs set status = 'cancel_requested' where kind = 'worker' and status = 'running'")
+
+
 def stop_all():
     dropped = 0
-    for queued in (DATA / "queue").glob("*.json"):
+    for queued, _ in queued_jobs():
         queued.unlink(missing_ok=True)
         dropped += 1
-    (DATA / "delegate" / "cancel").touch()  # the worker loop cancels its job and drops queued ones
+    try:
+        cancel_worker_jobs()
+    except Exception as e:  # noqa: BLE001
+        log("couldn't cancel worker jobs:", repr(e))
     proc = RUN["proc"]
     if proc:
         RUN["stopped"] = True
@@ -474,8 +617,30 @@ def stop_all():
     queue_message("Stopped everything." + (f" Dropped {dropped} queued job(s)." if dropped else ""))
 
 
+def status_text():
+    """What /status reports, without involving the model."""
+    job = RUN["job"]
+    lines = [f"Working on: {job['kind']}{' “' + job['label'] + '”' if job.get('label') else ''}, since {job['since']}"
+             if job else "Orchestrator: idle"]
+    waiting = [j["kind"] for _, j in queued_jobs()]
+    if waiting:
+        lines.append(f"Queued: {len(waiting)} ({', '.join(sorted(set(waiting)))})")
+    try:
+        for rid, label, status, progress in sql(
+                "select id, label, status, progress from agent.runs where kind = 'worker' "
+                "and status in ('running', 'cancel_requested', 'queued') order by id"):
+            lines.append(f"Worker run {rid} ({status}){': ' + clip(progress, 160) if progress else ''}")
+        upcoming = sql("select name, next_run_at from agent.schedules where enabled and next_run_at is not null "
+                       "order by next_run_at limit 5")
+        if upcoming:
+            lines.append("Next: " + "; ".join(f"{n} {t.astimezone().strftime('%a %H:%M')}" for n, t in upcoming))
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"(database unavailable: {e})")
+    return "\n".join(lines)
+
+
 def accept(job):
-    """Persists a job (crash-safe) after de-duplicating it; handles the /stop and /new commands."""
+    """Persists a job (crash-safe) after de-duplicating it; handles /stop, /new and /status."""
     if job["user"]:
         USER_FILE.write_text(job["user"])
     if job["kind"] != "messages":
@@ -492,10 +657,39 @@ def accept(job):
         elif command == "/new":
             SESSION_FILE.unlink(missing_ok=True)
             queue_message("Okay, starting a fresh conversation.")
+        elif command == "/status":
+            queue_message(status_text())
         else:
             fresh.append(msg)
     if fresh:
         enqueue({"kind": "messages", "user": job["user"], "messages": fresh})
+
+
+def take_next_job():
+    """The owner's messages first (all queued ones merged into one turn, once they've paused for
+    a couple of seconds), then worker reports, then scheduled tasks."""
+    jobs = queued_jobs()
+    if not jobs:
+        return None, None
+    jobs.sort(key=lambda j: (PRIORITY.get(j[1]["kind"], 9), j[0].name))
+    path, job = jobs[0]
+    running = DATA / "queue" / "running" / path.name
+    if job["kind"] != "messages":
+        path.rename(running)
+        return running, job
+    group = [j for j in jobs if j[1]["kind"] == "messages"]
+    try:
+        if time.time() - max(p.stat().st_mtime for p, _ in group) < 2:
+            return None, None
+    except FileNotFoundError:
+        return None, None
+    merged = {"kind": "messages", "user": group[-1][1]["user"], "messages": [m for _, j in group for m in j["messages"]]}
+    if any(j.get("resumed") for _, j in group):
+        merged["resumed"] = True
+    running.write_text(json.dumps(merged))
+    for p, _ in group:
+        p.unlink(missing_ok=True)
+    return running, merged
 
 
 def run_jobs(threads):
@@ -504,22 +698,23 @@ def run_jobs(threads):
         if dead:  # exit so Fly restarts the machine rather than limping on without, say, the poller
             log("thread died, restarting:", ", ".join(dead))
             os._exit(1)
-        queued = sorted((DATA / "queue").glob("*.json"))
-        if not queued:
-            time.sleep(1)
-            continue
-        running = DATA / "queue" / "running" / queued[0].name
         try:
-            queued[0].rename(running)
-        except FileNotFoundError:  # dropped by /stop
+            running, job = take_next_job()
+        except (OSError, ValueError) as e:  # e.g. a file /stop removed under us
+            log("queue:", repr(e))
+            running = job = None
+        if not job:
+            time.sleep(0.5)
             continue
-        job = json.loads(running.read_text())
+        RUN["job"] = {"kind": job["kind"], "label": job.get("name") or (job["id"] if job["kind"] == "report" else None),
+                      "since": datetime.now().astimezone().strftime("%H:%M")}
         try:
             handle(job)
         except Exception as e:  # noqa: BLE001 - one bad job must not take the bridge down
             log("job failed:", repr(e))
             queue_message(f"⚠️ The bridge hit an error on that job: {e!r}")
         finally:
+            RUN["job"] = None
             if not STOP.is_set():  # if we're being shut down, leave it to be resumed on next boot
                 running.unlink(missing_ok=True)
 
@@ -539,6 +734,9 @@ def fire_due_schedules():
         "select id, name, cron, tz, prompt, precheck, run_once, next_run_at from agent.schedules "
         "where enabled and (next_run_at is null or next_run_at <= now()) order by next_run_at nulls first"
     )
+    busy = {j.get("name") for _, j in queued_jobs() if j["kind"] == "task"}
+    if RUN["job"] and RUN["job"]["kind"] == "task":
+        busy.add(RUN["job"]["label"])
     for sid, name, cron, tz, prompt, precheck, run_once, due in rows:
         try:
             following = croniter(cron, datetime.now(ZoneInfo(tz))).get_next(datetime)
@@ -546,13 +744,18 @@ def fire_due_schedules():
             sql("update agent.schedules set enabled = false, last_error = %s where id = %s", f"disabled: {e}", sid)
             queue_message(f"⚠️ Schedule “{name}” was disabled: {e}")
             continue
-        if due is not None and owner():
+        if due is None:  # a new row: arm it for its first run
+            sql("update agent.schedules set next_run_at = %s, last_error = null where id = %s", following, sid)
+        elif not owner():
+            continue
+        elif name in busy:  # the previous run hasn't happened yet; don't pile up
+            log(f"schedule {name!r} skipped: its previous run is still queued or running")
+            sql("update agent.schedules set next_run_at = %s where id = %s", following, sid)
+        else:
             accept({"kind": "task", "user": owner(), "id": f"task:{sid}:{due.isoformat()}",
                     "name": name, "prompt": prompt, "precheck": precheck})
             sql("update agent.schedules set last_run_at = now(), next_run_at = %s, enabled = %s where id = %s",
                 following, not run_once, sid)
-        elif due is None:  # a new row: arm it for its first run
-            sql("update agent.schedules set next_run_at = %s, last_error = null where id = %s", following, sid)
 
 
 def load_offset():
@@ -677,18 +880,18 @@ def worker_env(residential=False, run_id=None):
     return "\n".join(lines) + "\n"
 
 
-def start_worker_job(job_id, brief, residential=False, run_id=None):
+def start_worker_job(job_dir, brief, residential=False, run_id=None):
     ensure_sprite()
-    job = f"{SPRITE_ROOT}/jobs/{job_id}"
+    job = f"{SPRITE_ROOT}/jobs/{job_dir}"
     for name in ("CLAUDE.md", "mcp.json", "provision.sh", "run.sh", "status.py"):
         sprite_write(f"{SPRITE_ROOT}/{name}", (APP / "worker" / name).read_bytes())
     sprite_write(f"{SPRITE_ROOT}/.env", worker_env(residential, run_id))
     if residential:
         brief += "\n\n[The owner authorized a residential IP (Byteful) for this job; its keys are in your environment.]"
     sprite_write(f"{job}/BRIEF.md", brief)
-    # Not retried: a failure can arrive after the job has started.
+    # Not retried: a failure can arrive after the job has started. The caller checks `launched`.
     sprite_sh(
-        f"sprite-env curl -X PUT /v1/tasks/job-{job_id} -d '{{\"expire\":\"5m\"}}' > /dev/null 2>&1; "
+        f"sprite-env curl -X PUT /v1/tasks/job-{job_dir} -d '{{\"expire\":\"5m\"}}' > /dev/null 2>&1; "
         f"setsid -f nohup bash {SPRITE_ROOT}/run.sh {job} > /dev/null 2>&1 < /dev/null; "
         f"echo ok > {job}/launched",
         retry=False,
@@ -697,110 +900,153 @@ def start_worker_job(job_id, brief, residential=False, run_id=None):
         raise RuntimeError("the job didn't launch")
 
 
-def worker_status(job_id):
-    job = f"{SPRITE_ROOT}/jobs/{job_id}"
-    sprite_sh(f"python3 {SPRITE_ROOT}/status.py {job} > {job}/status.json.tmp 2>&1; "
-              f"mv {job}/status.json.tmp {job}/status.json")
-    raw = sprite_read(f"{job}/status.json")
+def worker_status(job_dir, full=False):
+    job = f"{SPRITE_ROOT}/jobs/{job_dir}"
+    out = f"{job}/status{'-full' if full else ''}.json"
+    sprite_sh(f"python3 {SPRITE_ROOT}/status.py {job}{' full' if full else ''} > {out}.tmp 2>&1; mv {out}.tmp {out}")
+    raw = sprite_read(out)
     return json.loads(raw) if raw else None
 
 
-def cancel_worker_job(job_id):
+def cancel_worker_job(job_dir):
     """Marks the job cancelled; its launcher stops the agent. A job whose launcher died is ended here."""
-    job = f"{SPRITE_ROOT}/jobs/{job_id}"
+    job = f"{SPRITE_ROOT}/jobs/{job_dir}"
     sprite_sh(f"cd {job} 2> /dev/null || exit 0; [ -f exit_code ] && exit 0; : > cancelled; "
               f"pid=$(cat launcher.pid 2> /dev/null) && grep -qaF {job} /proc/$pid/cmdline 2> /dev/null "
               f"|| echo 143 > exit_code")
 
 
-def report(current, state, text):
+def report(job, state, text, steps=None, usage=None):
     """Ends the worker run and hands its report to the orchestrator as a new job."""
-    finish_run(current.get("run_id"), state, text)
-    header = f"[Worker report · job {current['id']} · run {current.get('run_id')} · {state}]"
-    accept({"kind": "report", "user": owner(), "id": f"report:{current['id']}", "prompt": f"{header}\n{text}"})
+    finish_run(job["id"], state, text, steps=steps, usage=usage)
+    header = f"[Worker report · job {job['label']} · run {job['id']} · {state}]"
+    accept({"kind": "report", "user": owner(), "id": f"report:{job['id']}",
+            "prompt": f"{header}\nBrief: {clip(job['input'], 300)}\n\n{text}"})
 
 
-def collect_worker_job(current, status):
-    """Copies the job's output/ files here and hands the worker's report to the orchestrator."""
-    local = DATA / "worker" / current["id"]
+def collect_worker_job(job, status):
+    """Copies the job's output/ files and step log here, and hands the report to the orchestrator."""
+    full = None
+    try:
+        full = worker_status(job["meta"]["dir"], full=True)
+    except Exception as e:  # noqa: BLE001 - the report matters more than the step log
+        log("worker step log unavailable:", repr(e))
+    status = full or status
+    local = DATA / "worker" / job["label"]
+    local.mkdir(parents=True, exist_ok=True)
+    give_to_agent(local)
     names = []
     for name in status.get("outputs", [])[:20]:
-        data = sprite_read(f"{SPRITE_ROOT}/jobs/{current['id']}/output/{name}")
+        data = sprite_read(f"{SPRITE_ROOT}/jobs/{job['meta']['dir']}/output/{name}")
         if data is None or len(data) > 25 * 2**20:
             continue
-        local.mkdir(parents=True, exist_ok=True)
-        give_to_agent(local)
         path = local / Path(name).name
         path.write_bytes(data)
         give_to_agent(path)
         names.append(path.name)
+    if status.get("steps"):
+        steps_file = local / "steps.json"
+        steps_file.write_text(json.dumps(status["steps"], indent=1))
+        give_to_agent(steps_file)
     state = ("cancelled" if status.get("cancelled") else "timed out" if status.get("timed_out")
              else "finished" if status.get("exit_code") == 0 else "failed")
-    lines = [f"Brief: {current['brief'][:300]}", "", status.get("final_message") or "(The worker sent no final message.)"]
+    text = status.get("final_message") or "(The worker sent no final message.)"
     if names:
-        lines += ["", f"Files copied to {local}/: {', '.join(names)}"]
+        text += f"\n\nFiles copied to {local}/: {', '.join(names)}"
+    if status.get("steps"):
+        text += f"\nIts step-by-step log: {local}/steps.json"
     if state != "finished" and status.get("log_tail"):
-        lines += ["", "[worker error output]", status["log_tail"][-1500:]]
-    report(current, state, "\n".join(lines))
+        text += f"\n\n[worker error output]\n{status['log_tail'][-1500:]}"
+    report(job, state, text, steps=(status.get("steps") or [])[-300:], usage=status.get("usage"))
+
+
+def worker_jobs(statuses, extra=""):
+    rows = sql("select id, label, input, meta, attempts, started_at, status from agent.runs "
+               f"where kind = 'worker' and status = any(%s) {extra} order by id limit 1", list(statuses))
+    if not rows:
+        return None
+    rid, label, text, meta, attempts, started_at, status = rows[0]
+    return {"id": rid, "label": label, "input": text, "meta": meta or {}, "attempts": attempts,
+            "started_at": started_at, "status": status}
+
+
+def requeue_worker_job(job, reason):
+    """Puts a job back in the queue with backoff, or gives up after WORKER_ATTEMPTS."""
+    if job["attempts"] >= WORKER_ATTEMPTS:
+        report(job, "failed", f"Gave up after {job['attempts']} attempts. Last problem: {reason}")
+        return
+    delay = RETRY_SECONDS * 2 * job["attempts"] ** 2
+    log(f"worker run {job['id']}: retrying in {delay:.0f}s ({reason})")
+    sql("update agent.runs set status = 'queued', meta = meta || %s::jsonb where id = %s",
+        jsonb({"retry_after": time.time() + delay, "last_problem": clip(reason, 500)}), job["id"])
+
+
+def start_next_worker_job():
+    job = worker_jobs(["queued"], "and coalesce((meta->>'retry_after')::float8, 0) <= extract(epoch from now())")
+    if not job:
+        return
+    job["attempts"] += 1
+    job["meta"]["dir"] = job["label"] if job["attempts"] == 1 else f"{job['label']}-{job['attempts']}"
+    sql("update agent.runs set status = 'running', attempts = %s, started_at = now(), progress = null, "
+        "meta = meta || %s::jsonb where id = %s", job["attempts"], jsonb({"dir": job["meta"]["dir"]}), job["id"])
+    try:
+        start_worker_job(job["meta"]["dir"], job["input"], job["meta"].get("residential") is True, job["id"])
+    except Exception as e:  # noqa: BLE001
+        try:  # a launch that errored may still have started; if so, follow it rather than start it twice
+            if sprite_read(f"{SPRITE_ROOT}/jobs/{job['meta']['dir']}/launched") is not None:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        log("worker start failed:", repr(e))
+        requeue_worker_job(job, f"couldn't start the worker: {e}")
+
+
+def follow_worker_job(job):
+    """Checks a running job: collects it when done, retries infrastructure failures, gives up on a
+    job that stopped responding."""
+    try:
+        status = worker_status(job["meta"]["dir"])
+    except Exception as e:  # noqa: BLE001 - the API is flaky; keep following the job
+        log("worker status:", repr(e))
+        status = {"state": "unknown"}
+    overdue = (datetime.now().astimezone() - job["started_at"]).total_seconds() > WORKER_TIMEOUT + 900
+    if status is None:
+        requeue_worker_job(job, "the job's files disappeared from the worker")
+    elif status["state"] == "finished":
+        if status.get("exit_code") == 97 and not status.get("cancelled"):  # provisioning failed: retry
+            requeue_worker_job(job, f"setting up the worker failed: {clip(status.get('log_tail'), 300)}")
+        else:
+            collect_worker_job(job, status)
+    elif overdue:
+        try:
+            cancel_worker_job(job["meta"]["dir"])
+        except Exception:  # noqa: BLE001
+            pass
+        report(job, "unresponsive", "The worker stopped responding, so the job was abandoned.")
+    elif status.get("progress"):
+        sql("update agent.runs set progress = %s where id = %s", clip(status["progress"], 500), job["id"])
 
 
 def worker_loop():
-    """One job at a time on the one sprite: start queued delegations, follow them, collect them."""
-    current = json.loads(WORKER_STATE.read_text()) if WORKER_STATE.exists() else None
+    """One job at a time on the one sprite. Jobs queue in agent.runs (kind 'worker'), which the
+    `delegate` command writes; this starts them, follows them every 30s, and collects them."""
+    TABLES_READY.wait()
     last_check = 0.0
     while not STOP.is_set():
         try:
-            cancel = DATA / "delegate" / "cancel"
-            if cancel.exists():
-                cancel.unlink()
-                for pending in (DATA / "delegate").glob("*.json"):
-                    pending.unlink()
-                if current:
-                    cancel_worker_job(current["id"])
-                    last_check = 0.0
-            if current and time.time() - last_check >= 30:
+            job = worker_jobs(["running", "cancel_requested"])
+            if job and job["status"] == "cancel_requested" and not job["meta"].get("cancel_sent"):
+                cancel_worker_job(job["meta"]["dir"])
+                sql("update agent.runs set meta = meta || '{\"cancel_sent\": true}' where id = %s", job["id"])
+                last_check = 0.0
+            if job and time.time() - last_check >= 30:
                 last_check = time.time()
-                try:
-                    status = worker_status(current["id"])
-                except Exception as e:  # noqa: BLE001 - the API is flaky; keep following the job
-                    log("worker status:", repr(e))
-                    status = {"state": "unknown"}
-                if status is None:
-                    report(current, "lost", "The job's files are gone from the worker.")
-                    current = None
-                elif status["state"] == "finished":
-                    collect_worker_job(current, status)
-                    current = None
-                elif time.time() - current["started"] > WORKER_TIMEOUT + 900:
-                    try:
-                        cancel_worker_job(current["id"])
-                    except Exception:  # noqa: BLE001
-                        pass
-                    report(current, "unresponsive", "The worker stopped responding, so the job was abandoned.")
-                    current = None
-                else:
-                    current["progress"] = status.get("progress")
-            if not current:
-                pending = sorted((DATA / "delegate").glob("*.json"))
-                if pending:
-                    request = json.loads(pending[0].read_text())
-                    pending[0].unlink()
-                    residential = request.get("residential") is True
-                    candidate = {"id": request["id"], "brief": request["brief"], "residential": residential,
-                                 "started": time.time(), "progress": None,
-                                 "run_id": start_run("worker", request["id"], request["brief"])}
-                    try:
-                        start_worker_job(request["id"], request["brief"], residential, candidate["run_id"])
-                        current, last_check = candidate, time.time()
-                    except Exception as e:  # noqa: BLE001
-                        log("worker start failed:", repr(e))
-                        report(candidate, "not started", f"The worker couldn't be started: {e}")
+                follow_worker_job(job)
+            elif not job:
+                start_next_worker_job()
+                last_check = time.time()
         except Exception as e:  # noqa: BLE001
             log("worker loop:", repr(e))
-        if current:
-            WORKER_STATE.write_text(json.dumps(current))
-        else:
-            WORKER_STATE.unlink(missing_ok=True)
         time.sleep(5)
 
 
@@ -808,18 +1054,19 @@ def worker_loop():
 
 
 def prepare():
-    for sub in ("queue/running", "state/seen", "inbox", "delegate", "worker", "workspace", "home/.claude"):
+    for sub in ("queue/running", "state/seen", "inbox", "runs", "worker", "workspace", "home/.claude"):
         (DATA / sub).mkdir(parents=True, exist_ok=True)
     for name in ("CLAUDE.md", "settings.json"):  # infrastructure-owned; refreshed on every boot
         shutil.copy(APP / "agent" / name, DATA / "home" / ".claude" / name)
     if os.geteuid() == 0:
-        for sub in ("inbox", "delegate", "worker", "workspace", "home", "home/.claude",
+        for sub in ("inbox", "runs", "worker", "workspace", "home", "home/.claude",
                     "home/.claude/CLAUDE.md", "home/.claude/settings.json"):
             os.chown(DATA / sub, *agent_ids())
-    cutoff = time.time() - 35 * 86400  # WhatsApp keeps updates 30 days
-    for marker in (DATA / "state" / "seen").iterdir():
-        if marker.stat().st_mtime < cutoff:
-            marker.unlink()
+    now = time.time()
+    for folder, days in (("state/seen", 35), ("runs", 90)):  # WhatsApp keeps updates for 30 days
+        for item in (DATA / folder).iterdir():
+            if item.is_file() and item.stat().st_mtime < now - days * 86400:
+                item.unlink()
     for interrupted in (DATA / "queue" / "running").glob("*.json"):
         job = json.loads(interrupted.read_text())
         job["resumed"] = True

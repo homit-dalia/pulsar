@@ -10,6 +10,7 @@ cd "$JOB"
 put() { printf %s "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
 put launcher.pid $$
 mkdir -p output
+find "$ROOT/jobs" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2> /dev/null  # keep a month of jobs
 . "$ROOT/.env"
 rm -f "$ROOT/.env"  # secrets live only in this process tree
 

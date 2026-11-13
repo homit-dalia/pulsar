@@ -3,3 +3,4 @@ README.md
 supabase/schema.sql
 fly.toml
 .github
+tests

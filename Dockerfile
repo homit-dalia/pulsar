@@ -20,6 +20,9 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/install-claude.sh \
  && chmod -R a+rX /opt/claude \
  && rm /tmp/install-claude.sh
 
+# boto3 for the orchestrator agent's own scripts (object storage); the bridge has its own venv.
+RUN pip install --no-cache-dir "boto3==1.40.*"
+
 # The bridge's two dependencies.
 RUN uv venv /opt/bridge --python /usr/local/bin/python3 \
  && uv pip install --python /opt/bridge/bin/python "psycopg[binary]==3.3.9" "croniter==7.0.0"

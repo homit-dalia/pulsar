@@ -54,6 +54,18 @@ create table if not exists agent.messages (
 );
 create index if not exists messages_outbox on agent.messages (id) where direction = 'out' and status = 'pending';
 
+-- Columns added after the first release (each statement is a no-op once applied).
+alter table agent.runs add column if not exists steps jsonb;                         -- compact log of what the run did
+alter table agent.runs add column if not exists usage jsonb;                         -- token counts reported by Claude Code
+alter table agent.runs add column if not exists meta jsonb not null default '{}';    -- e.g. transcript path, worker dir, residential
+alter table agent.runs add column if not exists attempts int not null default 0;
+alter table agent.runs add column if not exists progress text;                       -- worker jobs: the latest step
+alter table agent.messages add column if not exists attempts int not null default 0;
+alter table agent.messages add column if not exists next_attempt_at timestamptz;
+-- Worker jobs are queued as runs: queued -> running (-> cancel_requested) -> finished | failed | cancelled | ...
+create index if not exists runs_worker_queue on agent.runs (id)
+  where kind = 'worker' and status in ('queued', 'running', 'cancel_requested');
+
 -- What the agents did, in their own words: pages visited, form fields filled, files stored, decisions.
 create table if not exists agent.events (
   id         bigint generated always as identity primary key,
